@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import operator
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Annotated, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -73,9 +74,12 @@ def segregate_node(state: GraphState) -> dict:
         PageBundle(**p) if isinstance(p, dict) else p
         for p in pages_data
     ]
-    routing_map = classify_pages(pages)
+    routing_map, warnings = classify_pages(pages)
     logger.info("Segregation result: %s", routing_map)
-    return {"routing_map": routing_map}
+    updates: dict[str, Any] = {"routing_map": routing_map}
+    if warnings:
+        updates["confidence_flags"] = warnings
+    return updates
 
 
 def extract_id_node(state: GraphState) -> dict:
@@ -147,7 +151,58 @@ def extract_bill_node(state: GraphState) -> dict:
         logger.error("Bill extraction failed: %s", e)
         return {"bill_data": {}, "confidence_flags": [f"Bill extraction failed: {e}"]}
 
-    return {"bill_data": bill_data}
+    # Enforce deterministic total calculation from extracted line items.
+    normalized_bill_data, bill_flags = _normalize_bill_totals(bill_data)
+    if bill_flags:
+        return {"bill_data": normalized_bill_data, "confidence_flags": bill_flags}
+
+    return {"bill_data": normalized_bill_data}
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _normalize_bill_totals(bill_data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Derive bill total from line items and reconcile model-provided totals."""
+    flags: list[str] = []
+    line_items = bill_data.get("line_items") or []
+    computed_total = Decimal("0")
+    has_any_amount = False
+
+    for item in line_items:
+        if not isinstance(item, dict):
+            continue
+        amount = _to_decimal(item.get("amount"))
+        if amount is None:
+            qty = _to_decimal(item.get("quantity"))
+            unit_price = _to_decimal(item.get("unit_price"))
+            if qty is not None and unit_price is not None:
+                amount = qty * unit_price
+        if amount is not None:
+            computed_total += amount
+            has_any_amount = True
+
+    if not has_any_amount:
+        return bill_data, flags
+
+    rounded_total = float(computed_total.quantize(Decimal("0.01")))
+    model_total = _to_decimal(bill_data.get("total_amount"))
+
+    # Always provide a deterministic total; flag when we had to correct mismatch.
+    normalized = dict(bill_data)
+    normalized["total_amount"] = rounded_total
+    if model_total is not None and abs(model_total - computed_total) > Decimal("0.5"):
+        flags.append(
+            f"Bill total mismatch detected. Using computed total {rounded_total:.2f} instead of model total {float(model_total):.2f}."
+        )
+
+    return normalized, flags
 
 
 def assemble_node(state: GraphState) -> dict:
@@ -178,30 +233,10 @@ def assemble_node(state: GraphState) -> dict:
 # Graph construction
 # ---------------------------------------------------------------------------
 
-def _should_extract(state: GraphState) -> list[str]:
-    """
-    Determine which extraction nodes to run based on the routing map.
-    Returns a list of node names to invoke next.
-    """
-    routing_map = state.get("routing_map", {})
-    next_nodes = []
-    if routing_map.get("identity_document"):
-        next_nodes.append("extract_id")
-    if routing_map.get("discharge_summary"):
-        next_nodes.append("extract_discharge")
-    if routing_map.get("itemized_bill"):
-        next_nodes.append("extract_bill")
-    # If nothing was classified into these types, go straight to assemble
-    if not next_nodes:
-        next_nodes.append("assemble")
-    return next_nodes
-
-
 def build_graph():
     """Build and compile the LangGraph claim processing workflow."""
 
-    graph = StateGraph(GraphState)  # ← TypedDict, NOT bare dict
-
+    graph = StateGraph(GraphState)
     # Add nodes
     graph.add_node("preprocess", preprocess_node)
     graph.add_node("segregate", segregate_node)
@@ -216,22 +251,14 @@ def build_graph():
     # preprocess → segregate
     graph.add_edge("preprocess", "segregate")
 
-    # segregate → conditional fan-out to extraction agents
-    graph.add_conditional_edges(
-        "segregate",
-        _should_extract,
-        {
-            "extract_id": "extract_id",
-            "extract_discharge": "extract_discharge",
-            "extract_bill": "extract_bill",
-            "assemble": "assemble",
-        },
-    )
+    # Deterministic fan-out/fan-in: all extractor nodes run, but each node only
+    # calls its LLM when routing_map has relevant pages.
+    graph.add_edge("segregate", "extract_id")
+    graph.add_edge("segregate", "extract_discharge")
+    graph.add_edge("segregate", "extract_bill")
 
-    # All extraction agents → assemble
-    graph.add_edge("extract_id", "assemble")
-    graph.add_edge("extract_discharge", "assemble")
-    graph.add_edge("extract_bill", "assemble")
+    # Wait for all extractors to complete before assembling final output.
+    graph.add_edge(["extract_id", "extract_discharge", "extract_bill"], "assemble")
 
     # assemble → END
     graph.add_edge("assemble", END)

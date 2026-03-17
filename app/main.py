@@ -2,8 +2,8 @@
 FastAPI application — HTTP gateway for the claim processing pipeline.
 
 Endpoints:
-  POST /api/claims/process — upload a PDF claim and get structured JSON back
-  GET  /health              — basic health check
+  POST /api/process — upload a PDF claim and get structured JSON back
+  GET  /health      — basic health check
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/api/claims/process")
+@app.post("/api/process")
 async def process_claim(
     claim_id: str = Form(..., description="Unique claim identifier, e.g. CLM-001"),
     file: UploadFile = File(..., description="PDF file to process"),
@@ -78,6 +78,13 @@ async def process_claim(
         )
 
     file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # Validate PDF magic bytes to avoid relying only on content-type headers.
+    if not file_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid PDF.")
+
     size_mb = len(file_bytes) / (1024 * 1024)
     if size_mb > settings.MAX_FILE_SIZE_MB:
         raise HTTPException(
@@ -119,6 +126,7 @@ async def process_claim(
     logger.info("Claim %s processed successfully", claim_id)
 
     return JSONResponse(content=final)
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
